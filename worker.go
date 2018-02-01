@@ -4,13 +4,15 @@ import (
 	"database/sql"
 	"fmt"
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/robfig/cron"
 	"os"
 	"time"
 )
 
 type CronWorker struct {
-	Db *sql.DB
-	Id int64
+	Db         *sql.DB
+	Id         int64
+	CronParser *cron.Parser
 }
 
 func NewCronWorker(conn string) (worker *CronWorker, err *error) {
@@ -21,9 +23,10 @@ func NewCronWorker(conn string) (worker *CronWorker, err *error) {
 		err = &e
 		return
 	}
+	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
 	worker = new(CronWorker)
 	worker.Db = db
-	fmt.Fprintln(os.Stderr, "Connected")
+	worker.CronParser = &parser
 	err = nil
 	return
 }
@@ -54,65 +57,138 @@ func (worker *CronWorker) Join() {
 func (worker *CronWorker) FindWork() {
 }
 
-func (worker *CronWorker) getQueueLock() bool {
-	rows, err := worker.Db.Query("SELECT GET_LOCK('queue_jobs', 0)")
-	if err != nil {
-		panic(err)
-	}
-	var locked int
-	rows.Next()
-	if err := rows.Scan(&locked); err != nil {
-		panic(err)
-	}
-	if locked == 1 {
-		fmt.Fprintf(os.Stderr, "Worker %d got queue_jobs lock and will now queue next runs\n", worker.Id)
-		return true
-	} else {
-		fmt.Fprintf(os.Stderr, "Worker %d failed to get queue_jobs lock; another process is queueing\n", worker.Id)
-		return false
-	}
+// have to work around the lack of proper cursor multiplexing in the mysql driver, d'oh!
+
+type Schedulable struct {
+	job_id, run_parallel, num_queued, num_running, updated_retry int
+	last_started                                                 sql.NullString
+	schedule                                                     string
 }
 
-func (worker *CronWorker) releaseQueueLock() {
-	_, err := worker.Db.Exec("SELECT RELEASE_LOCK('queue_jobs')")
-	if err != nil {
-		panic(err)
-	} else {
-    fmt.Fprintln(os.Stderr,"lock released")
-  }
+type ExecInsertData struct {
+	JobId   int
+	NextRun time.Time
+}
+
+type SchedErrUpdate struct {
+	ErrMsg string
+	JobId  int
+}
+
+type SchedulePass struct {
+	Schedulables     []*Schedulable
+	JobUpdateQueries []*SchedErrUpdate
+	InsertData       []*ExecInsertData
+	InsertQuery      string
+	UpdateStatement  string
+}
+
+func NewSchedulePass() *SchedulePass {
+	sp := new(SchedulePass)
+	sp.InsertQuery = "INSERT INTO job_executions ( job_id, scheduled_start ) VALUES "
+	sp.UpdateStatement = "UPDATE jobs SET schedule_error = ?,  schedule_error_time=NOW() WHERE id = ?"
+	return sp
 }
 
 func (worker *CronWorker) ScheduleNextRun() {
-	if worker.getQueueLock() == false {
-		return
-	}
-	defer worker.releaseQueueLock()
-	rows, err := worker.Db.Query(`
-    select jobs.id as job_id, jobs.run_parallel, schedule, 
-      SUM(if(job_executions.started is null and job_executions.id is not null,1,0)) as num_queued, 
-      SUM(if(job_executions.ended is null and job_executions.started is not null,1,0)) as num_running, 
-      MAX(started) last_started
-      FROM jobs left join job_executions on ( jobs.id = job_executions.job_id ) 
-      GROUP BY jobs.id 
-      HAVING num_queued + num_running < jobs.run_parallel ;
-  `)
+	sp := NewSchedulePass()
+	tx, err := worker.Db.Begin()
 	if err != nil {
 		panic(err)
 	}
+	if err != nil {
+		panic(fmt.Sprintf("couldn't prepare insert for new jobs: %s", err))
+	}
+	rows, err := tx.Query(`
+    SELECT jobs.id AS job_id, jobs.run_parallel, schedule, 
+      SUM(IF(job_executions.started IS NULL AND job_executions.id IS NOT NULL,1,0)) AS num_queued, 
+      SUM(IF(job_executions.ended IS NULL AND job_executions.started IS NOT NULL,1,0)) AS num_running, 
+      MAX(started) last_started,
+      IF( jobs.schedule_error_time IS NULL, 0, 1) AS updated_retry
+      FROM jobs LEFT JOIN job_executions ON ( jobs.id = job_executions.job_id ) 
+      WHERE ( jobs.updated > jobs.schedule_error_time or jobs.schedule_error_time IS NULL)
+      GROUP BY jobs.id 
+      HAVING num_queued + num_running < jobs.run_parallel 
+    FOR UPDATE
+  `)
+	if err != nil {
+		tx.Rollback()
+		panic(err)
+	}
 	for rows.Next() {
-		var job_id, run_parallel, num_queued, num_running int
-		var last_started, schedule sql.NullString
-		if err = rows.Scan(&job_id, &run_parallel, &schedule, &num_queued, &num_running, &last_started); err != nil {
+		s := new(Schedulable)
+		if err = rows.Scan(&s.job_id, &s.run_parallel, &s.schedule, &s.num_queued, &s.num_running, &s.last_started, &s.updated_retry); err != nil {
+			tx.Rollback()
 			panic(err)
 		}
-		fmt.Fprintf(os.Stderr, "job_id:   \t%d\nschedule:\t%s\nrun_parallel:\t%d\nnum_queued:\t%d\nnum_running:\t%d\nlast_started:\t%s\n", job_id, schedule.String, run_parallel, num_queued, num_running, last_started.String)
+		fmt.Fprintf(os.Stderr,
+			"job_id:   \t%d\nschedule:\t%s\nrun_parallel:\t%d\nnum_queued:\t%d\nnum_running:\t%d\nlast_started:\t%s\n",
+			s.job_id, s.schedule, s.run_parallel, s.num_queued, s.num_running, s.last_started.String,
+		)
+		// when will this next be happening?
+		var last_started_time time.Time
+		if s.last_started.Valid {
+			panic("TODO: need to figure out how to parse this time " + s.last_started.String)
+		} else {
+			last_started_time = time.Unix(0, 0)
+		}
+		sched, err := worker.CronParser.Parse(s.schedule)
+		if err != nil {
+			msg := fmt.Sprintf("Failed to parse '%s': %s", s.schedule, err)
+			fmt.Fprintln(os.Stderr, msg)
+			// the WHERE clause above stops us from doing this too frequently ( only after update )
+			sp.JobUpdateQueries = append(
+				sp.JobUpdateQueries,
+				&SchedErrUpdate{ErrMsg: msg, JobId: s.job_id},
+			)
+			continue
+		}
+		next_time := sched.Next(last_started_time)
+		//if time.Now().After(next_time) {
+		//	next_time = time.Now()
+		//}
+		fmt.Println("The job should run next on: ", next_time)
+		sp.InsertData = append(
+			sp.InsertData,
+			&ExecInsertData{JobId: s.job_id, NextRun: next_time},
+		)
+	}
+	if len(sp.JobUpdateQueries) > 0 {
+		stmt, err := tx.Prepare(sp.UpdateStatement)
+		if err != nil {
+			tx.Rollback()
+			panic(fmt.Sprintf("Error updating job queries: %s", err))
+		}
+		for _, data := range sp.JobUpdateQueries {
+			_, err := stmt.Exec(data.ErrMsg, data.JobId)
+			if err != nil {
+				tx.Rollback()
+				panic(err)
+			}
+		}
+	}
+	if len(sp.InsertData) > 0 {
+		query := sp.InsertQuery
+		for i, data := range sp.InsertData {
+			if i > 0 {
+				query += ", "
+			}
+			query += fmt.Sprintf("(%d,'%s')", data.JobId, data.NextRun.UTC().Format("2006-01-02 15:04:05.000000"))
+		}
+		if _, err := tx.Exec(query); err != nil {
+			tx.Rollback()
+			panic(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		panic(fmt.Sprintf("Couldn't commit transacrtion: %s", err))
 	}
 }
 
 func main() {
-	worker, errp := NewCronWorker("root:@tcp(127.0.0.1:3306)/drcron")
-	if errp != nil {
-		panic(*errp)
+	worker, err := NewCronWorker("root:@tcp(127.0.0.1:3306)/drcron")
+	if err != nil {
+		panic(*err)
 	}
 	worker.Join()
 	for {
