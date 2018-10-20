@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"fmt"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/robfig/cron"
+	"io"
 	"os"
+	"os/exec"
+	"syscall"
 	"time"
 )
 
@@ -209,8 +213,8 @@ func (worker *CronWorker) ScheduleNextRun() {
 }
 
 func (worker *CronWorker) AssignWork() {
-  // can't update limit 1 on two tables. Instead, let's select for update the job we want to do
-  // and then we'll update and commit the transaction.
+	// can't update limit 1 on two tables. Instead, let's select for update the job we want to do
+	// and then we'll update and commit the transaction.
 	query := `
     UPDATE job_executions 
     SET worker_id = ? 
@@ -219,14 +223,14 @@ func (worker *CronWorker) AssignWork() {
     LIMIT 1
   `
 	/*query := `
-    UPDATE job_executions 
-    JOIN jobs ON ( job_executions.job_id = jobs.id )
-    SET worker_id = ? 
-    WHERE scheduled_start <= NOW() 
-      AND started IS NULL
-      AND jobs.enabled = TRUE 
-    LIMIT 1
-  `*/
+	  UPDATE job_executions
+	  JOIN jobs ON ( job_executions.job_id = jobs.id )
+	  SET worker_id = ?
+	  WHERE scheduled_start <= NOW()
+	    AND started IS NULL
+	    AND jobs.enabled = TRUE
+	  LIMIT 1
+	`*/
 	stmt, err := worker.Db.Prepare(query)
 	if err != nil {
 		panic(fmt.Sprintf("Couldn't prepare query\n%s\nError: %s", query, err))
@@ -239,6 +243,43 @@ func (worker *CronWorker) AssignWork() {
 type Execution struct {
 	execution_id int
 	command      string
+}
+
+func (worker *CronWorker) recordExecStart(ex *Execution) {
+	query := "UPDATE job_executions SET started = NOW() WHERE id = ?"
+	stmt, err := worker.Db.Prepare(query)
+	if err != nil {
+		panic(fmt.Sprintf("Couldn't prepare query\n%s\nError: %s", query, err))
+	}
+	if _, err := stmt.Exec(ex.execution_id); err != nil {
+		panic(fmt.Sprintf("Couldn't record job execution start: %s", worker.Id, err))
+	}
+}
+
+func (worker *CronWorker) recordExecEnd(ex *Execution, err error) {
+	// todo: process state could be returned to collect runtime information
+	var args []interface{}
+	var query string
+	if err == nil {
+		query = "UPDATE job_executions SET ended = NOW(), exit_code = 0 WHERE id = ?"
+		args = []interface{}{ex.execution_id}
+	} else {
+		query = "UPDATE job_executions SET ended = NOW(), error = ? WHERE id = ?"
+		args = []interface{}{err.Error(), ex.execution_id}
+		if execerr, ok := err.(*exec.ExitError); ok {
+			if exit_status, ok := execerr.Sys().(syscall.WaitStatus); ok {
+				query = "UPDATE job_executions SET ended = NOW(), exit_code = ?, error = ? WHERE id = ?"
+				args = []interface{}{exit_status, execerr.Error(), ex.execution_id}
+			}
+		}
+	}
+	stmt, err := worker.Db.Prepare(query)
+	if err != nil {
+		panic(fmt.Sprintf("Couldn't prepare query\n%s\nError: %s", query, err))
+	}
+	if _, err := stmt.Exec(args...); err != nil {
+		panic(fmt.Sprintf("Couldn't record job execution end: %s", worker.Id, err))
+	}
 }
 
 func (worker *CronWorker) FindAssignedWork() (execs []*Execution) {
@@ -280,17 +321,53 @@ func main() {
 		execs := worker.FindAssignedWork()
 		fmt.Println(execs)
 		if len(execs) > 0 {
-			for _, ex := range execs {
-				fmt.Printf("should run job command '%s'", ex.command)
+			for _, ex := range execs { //TODO: parallelize
+				cmd := exec.Command("bash", "-c", ex.command)
+				var stdoutBuf, stderrBuf bytes.Buffer
+				stdoutIn, _ := cmd.StdoutPipe()
+				stderrIn, _ := cmd.StderrPipe()
+				stdout := io.MultiWriter(os.Stdout, &stdoutBuf)
+				stderr := io.MultiWriter(os.Stderr, &stderrBuf)
+				var errStdout, errStderr error
+				go func() {
+					_, errStdout = io.Copy(stdout, stdoutIn)
+				}()
+				go func() {
+					_, errStderr = io.Copy(stderr, stderrIn)
+				}()
+				starterr := cmd.Start()
+				if starterr != nil {
+					// TODO: better error handling
+					panic(fmt.Sprintf("error starting command: %s", starterr.Error()))
+				}
+				fmt.Printf("Exec job command '%s'", ex.command)
+				worker.recordExecStart(ex)
+				// TODO: a goroutine could update the database for us for the pings, could send and clear stderr buffers too ?
+				waiterr := cmd.Wait()
+				worker.recordExecEnd(ex, waiterr)
+				if waiterr != nil {
+					panic(waiterr)
+				}
+				if errStdout != nil {
+					panic(fmt.Sprintf("Failed to capture stderr: %s\n", errStdout.Error()))
+				}
+				if errStderr != nil {
+					panic(fmt.Sprintf("Failed to capture stderr: %s\n", errStderr.Error()))
+				}
+				// TODO: ping while command runs and update
+				fmt.Printf("Job ran:\n%s\n%s\n", string(stdoutBuf.Bytes()), string(stderrBuf.Bytes()))
+				//TODO: save results to database
 			}
 		} else {
+			fmt.Fprintln(os.Stderr, "No work to do at the moment.")
+			time.Sleep(3 * time.Second)
 			worker.ScheduleNextRun()
 			worker.AssignWork()
 			continue
 		}
 		if len(os.Getenv("ONEPASS")) > 0 {
+			fmt.Fprintln(os.Stderr, "ONEPASS is configured, so I'll exit now.")
 			break
 		}
-		time.Sleep(1 * time.Second)
 	}
 }

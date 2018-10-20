@@ -15,8 +15,8 @@ schema: db
 	docker cp tables.sql mysql:/tmp && docker exec -it mysql bash -c 'until mysql -h 127.0.0.1 mysql -e "select 1" > /dev/null; do sleep 3; done; mysql < /tmp/tables.sql'
 	# docker exec -it mysql mysqldump --no-data --databases drcron
 	
-worker: schema
-	ONEPASS=true go run worker.go
+worker:
+	ONEPASS=$${ONEPASS:-true} go run worker.go
 
 select_workers:
 	docker exec -it mysql mysql drcron -e 'SELECT * FROM workers'

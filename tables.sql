@@ -1,5 +1,6 @@
 
-create database if not exists drcron;
+drop database drcron;
+create database drcron;
 
 use drcron;
 
@@ -19,8 +20,8 @@ create table if not exists jobs (
 );
 
 INSERT INTO jobs ( name, schedule, command, enabled )  VALUES 
-("sleep10job", "* * * * *", "bash -c 'sleep 10; echo slept 10'", true ) ,
-("sleep5job", "* * * * *", "bash -c 'sleep 5; echo slept 5'", true ) 
+("sleep10job", "* * * * *", "slept=0; while [ $slept -lt 10 ]; do sleep 1; slept=$(($slept+1)); echo slept $slept; done", true ) , 
+("sleep5job", "* * * * *", "sleep 5; echo slept 5", true ) 
 ON DUPLICATE KEY UPDATE 
   command=VALUES(command),
   schedule=VALUES(schedule)
