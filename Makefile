@@ -16,7 +16,7 @@ schema: db
 	# docker exec -it mysql mysqldump --no-data --databases drcron
 	
 worker:
-	ONEPASS=$${ONEPASS:-true} go run worker.go
+	ONEPASS=$${ONEPASS:-} go run worker.go
 
 select_workers:
 	docker exec -it mysql mysql drcron -e 'SELECT * FROM workers'

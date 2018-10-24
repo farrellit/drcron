@@ -1,10 +1,10 @@
 package main
 
 import (
-	"bytes"
+	//"bytes"
 	"database/sql"
 	"fmt"
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/go-sql-driver/mysql"
 	"github.com/robfig/cron"
 	"io"
 	"os"
@@ -120,7 +120,10 @@ func (sp *SchedulePass) ProcessSchedulableRow(rows *sql.Rows) {
 	// when will this next be happening?
 	var last_started_time time.Time
 	if s.last_started.Valid {
-		panic("TODO: need to figure out how to parse this time " + s.last_started.String)
+		var err error
+		if last_started_time, err = time.Parse("2006-01-02 15:04:05", s.last_started.String); err != nil {
+			panic(fmt.Sprintf("Couldn't parse time %s: %s", s.last_started.String, err.Error()))
+		}
 	} else {
 		last_started_time = time.Unix(0, 0)
 	}
@@ -160,18 +163,16 @@ func SQLTime(t *time.Time) string {
 	return t.UTC().Format("2006-01-02 15:04:05.000000")
 }
 
-func (worker *CronWorker) ScheduleNextRun() {
+func (worker *CronWorker) ScheduleNextRun() (scheduled int) {
 	// TODO, might still make sense to do a LOCK here, even with transaction.  Otherwise it's just gonna be extra
 	//        work amounting to deadlock over and over again
 	tx, err := worker.Db.Begin()
 	if err != nil {
-		panic(err)
+		panic(fmt.Sprintf("couldn't begin insert within ScheduleNextRun: %s", err))
 	}
 	sp := NewSchedulePass(tx, worker.CronParser)
-	if err != nil {
-		panic(fmt.Sprintf("couldn't prepare insert for new jobs: %s", err))
-	}
 	rows, err := tx.Query(sp.SchedulingQuery())
+	defer rows.Close()
 	if err != nil {
 		tx.Rollback()
 		panic(err)
@@ -179,12 +180,14 @@ func (worker *CronWorker) ScheduleNextRun() {
 	for rows.Next() {
 		sp.ProcessSchedulableRow(rows)
 	}
+	scheduled = len(sp.JobUpdateQueries)
 	if len(sp.JobUpdateQueries) > 0 {
 		stmt, err := tx.Prepare(sp.UpdateStatement)
 		if err != nil {
 			tx.Rollback()
 			panic(fmt.Sprintf("Error updating job queries: %s", err))
 		}
+		defer stmt.Close()
 		for _, data := range sp.JobUpdateQueries {
 			_, err := stmt.Exec(data.ErrMsg, data.JobId)
 			if err != nil {
@@ -210,6 +213,7 @@ func (worker *CronWorker) ScheduleNextRun() {
 		// TODO: catch deadlock here, as that almost certainly means a conflicting schedule pass.  This is all best effort.
 		panic(fmt.Sprintf("Couldn't commit transaction: %s", err))
 	}
+	return
 }
 
 func (worker *CronWorker) AssignWork() {
@@ -220,6 +224,7 @@ func (worker *CronWorker) AssignWork() {
     SET worker_id = ? 
     WHERE scheduled_start <= NOW() 
       AND started IS NULL
+      AND worker_id IS NULL
     LIMIT 1
   `
 	/*query := `
@@ -235,8 +240,17 @@ func (worker *CronWorker) AssignWork() {
 	if err != nil {
 		panic(fmt.Sprintf("Couldn't prepare query\n%s\nError: %s", query, err))
 	}
+	defer stmt.Close()
 	if _, err := stmt.Exec(worker.Id); err != nil {
-		panic(fmt.Sprintf("Couldn't schedule next job execution for worker %d: %s", worker.Id, err))
+		if mysqlerr, ok := err.(*mysql.MySQLError); ok {
+			if mysqlerr.Number == 1213 {
+				fmt.Fprintln(os.Stderr, "Deadlock assigning work, retrying")
+				time.Sleep(10 * time.Microsecond) // add some swerve
+				worker.AssignWork()               // try again on deadlock
+				return
+			}
+		}
+		panic(fmt.Sprintf("Couldn't schedule next job execution for worker %d: %T: %s", worker.Id, err, err))
 	}
 }
 
@@ -251,6 +265,7 @@ func (worker *CronWorker) recordExecStart(ex *Execution) {
 	if err != nil {
 		panic(fmt.Sprintf("Couldn't prepare query\n%s\nError: %s", query, err))
 	}
+	defer stmt.Close()
 	if _, err := stmt.Exec(ex.execution_id); err != nil {
 		panic(fmt.Sprintf("Couldn't record job execution start: %s", worker.Id, err))
 	}
@@ -277,6 +292,7 @@ func (worker *CronWorker) recordExecEnd(ex *Execution, err error) {
 	if err != nil {
 		panic(fmt.Sprintf("Couldn't prepare query\n%s\nError: %s", query, err))
 	}
+	defer stmt.Close()
 	if _, err := stmt.Exec(args...); err != nil {
 		panic(fmt.Sprintf("Couldn't record job execution end: %s", worker.Id, err))
 	}
@@ -296,19 +312,96 @@ func (worker *CronWorker) FindAssignedWork() (execs []*Execution) {
 	if err != nil {
 		panic(fmt.Sprintf("Couldn't prepare query\n%s\nError: %s", query, err))
 	}
+	defer stmt.Close()
 	rows, err := stmt.Query(worker.Id)
 	if err != nil {
 		panic(fmt.Sprintf("Couldn't prepare query\n%s\nError: %s", query, err))
 	}
+	defer rows.Close()
 	for rows.Next() {
 		ex := new(Execution)
 		if err := rows.Scan(&ex.execution_id, &ex.command); err != nil {
 			panic(fmt.Sprintln("Failed to scan next job execution query result: ", err))
 		}
-		fmt.Fprintln(os.Stderr, "FindAssignedWork query returned job exec Id %d, %s", ex.execution_id, ex.command)
+    if false {
+		  fmt.Fprintln(os.Stderr, "FindAssignedWork query returned job exec Id %d, %s", ex.execution_id, ex.command)
+    }
 		execs = append(execs, ex)
 	}
 	return execs
+}
+
+func (w *CronWorker) MustPrepareStatement(query string) (stmt *sql.Stmt) {
+	stmt, err := w.Db.Prepare(query)
+	if err != nil {
+		panic(fmt.Sprintf("Couldn't prepare query\n%s\nError: %s", query, err))
+	}
+	return
+}
+
+func (w *CronWorker) TimeTillNextJob() (microseconds int) {
+	microseconds = 3000000 // default
+	query := `
+    SELECT TIMESTAMPDIFF(MICROSECOND, NOW(6),scheduled_start) AS microseconds_to_wait 
+      FROM job_executions 
+     WHERE started IS NULL 
+       AND worker_id IS NULL
+     ORDER BY scheduled_start ASC LIMIT 1;
+    `
+	stmt := w.MustPrepareStatement(query)
+	defer stmt.Close()
+	rows, err := stmt.Query()
+	defer rows.Close()
+	if err != nil {
+		panic(fmt.Sprintf("Error querying, query '%s', error %T %s\n", query, err, err.Error()))
+	}
+	if rows.Next() {
+		if err := rows.Scan(&microseconds); err != nil {
+			panic(fmt.Sprintln("Failed to scan query '%s' result row: %T %s", query, err, err.Error()))
+    }
+	}
+  // if it's this close, don't sleep.  
+  if microseconds < 0 {
+    microseconds = 0
+  }
+	return
+}
+
+func (w *CronWorker) GetLogWriter(ex *Execution, source string) *LogWriter {
+	return &LogWriter{
+		exid:   ex.execution_id,
+		db:     w.Db,
+		source: source,
+	}
+}
+
+type LogWriter struct {
+	exid   int
+	source string //'stdout' or 'stderr'
+	db     *sql.DB
+}
+
+func (lw *LogWriter) Write(p []byte) (int, error) {
+	go func(exid int, source string, data string) {
+		query := `
+      INSERT INTO job_execution_logs SET execution_id = ?, source = ?, output = ?
+    `
+		stmt, err := lw.db.Prepare(query)
+		if err != nil {
+			panic(fmt.Sprintf("Lost log: couldn't prepare query\n%s\nError: %s", query, err))
+		}
+		defer stmt.Close()
+		res, err := stmt.Exec(exid, source, data)
+		lid, err := res.LastInsertId()
+		if err != nil {
+			panic(fmt.Sprintf("Lost Log: Couldn't execute query\n%s\nError: %s", query, err))
+		}
+		if false { // todo: log levels
+			fmt.Fprintf(os.Stderr, "Logged exid %d output source %s to log entry %d\n", lw.exid, lw.source, lid)
+		}
+	}(lw.exid, lw.source, string(p))
+	//fmt.Fprintf(os.Stderr, "Spawned goroutine to log output source %s '%s'\n", lw.source, string(p))
+	return len(p), nil
 }
 
 func main() {
@@ -317,17 +410,19 @@ func main() {
 		panic(*err)
 	}
 	worker.Join()
+  var already_said bool = false // notify once for polling loop
 	for {
+		worker.AssignWork()
 		execs := worker.FindAssignedWork()
-		fmt.Println(execs)
 		if len(execs) > 0 {
+      already_said = false; // if we get into a polling loop for new work, we should notify once.
 			for _, ex := range execs { //TODO: parallelize
 				cmd := exec.Command("bash", "-c", ex.command)
-				var stdoutBuf, stderrBuf bytes.Buffer
+				//var stdoutBuf, stderrBuf bytes.Buffer
 				stdoutIn, _ := cmd.StdoutPipe()
 				stderrIn, _ := cmd.StderrPipe()
-				stdout := io.MultiWriter(os.Stdout, &stdoutBuf)
-				stderr := io.MultiWriter(os.Stderr, &stderrBuf)
+				stdout := io.MultiWriter(os.Stdout /*&stdoutBuf,*/, worker.GetLogWriter(ex, "stdout"))
+				stderr := io.MultiWriter(os.Stderr /*&stderrBuf,*/, worker.GetLogWriter(ex, "stderr"))
 				var errStdout, errStderr error
 				go func() {
 					_, errStdout = io.Copy(stdout, stdoutIn)
@@ -349,20 +444,32 @@ func main() {
 					panic(waiterr)
 				}
 				if errStdout != nil {
-					panic(fmt.Sprintf("Failed to capture stderr: %s\n", errStdout.Error()))
+					fmt.Fprintf(os.Stderr, "Warning, failed to capture stdout - %T - %s\n", errStdout, errStdout.Error())
 				}
 				if errStderr != nil {
-					panic(fmt.Sprintf("Failed to capture stderr: %s\n", errStderr.Error()))
+					fmt.Fprintf(os.Stderr, "Warning, failed to capture stderr - %T - %s\n", errStderr, errStderr.Error())
 				}
 				// TODO: ping while command runs and update
-				fmt.Printf("Job ran:\n%s\n%s\n", string(stdoutBuf.Bytes()), string(stderrBuf.Bytes()))
+				fmt.Printf("Job finished.\n")
 				//TODO: save results to database
 			}
+		} else if worker.ScheduleNextRun() > 0 {
+			// we scheduled something
+			continue
 		} else {
-			fmt.Fprintln(os.Stderr, "No work to do at the moment.")
-			time.Sleep(3 * time.Second)
-			worker.ScheduleNextRun()
-			worker.AssignWork()
+      usec := worker.TimeTillNextJob()
+      if usec > 3000000 {
+        // 3 seconds ?  We bettr check again for new jobs eventually
+			  if ! already_said {
+          fmt.Fprintf(os.Stderr, "No work to do for at least 3 seconds; I'll poll every 3 sec for new jobs.\n")
+          already_said = true
+        }
+			  time.Sleep(time.Duration(3) * time.Second )
+      } else if usec > 2000 {
+        already_said = false // if we miss our job, and get into a 3 second loop, we should say so agian.
+			  fmt.Fprintf(os.Stderr, "No work to do at the moment and nothing to schedule; sleeping %d us for next job\n",usec)
+			  time.Sleep(time.Duration(usec) * time.Microsecond )
+      } // under 2ms? let's just try again , it'll take 2ms to have gotten this response and rerun the query.
 			continue
 		}
 		if len(os.Getenv("ONEPASS")) > 0 {
