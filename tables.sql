@@ -1,5 +1,5 @@
 
-drop database drcron;
+drop database if exists drcron;
 create database drcron;
 
 use drcron;
@@ -35,7 +35,7 @@ CREATE TABLE if not exists workers (
   id bigint unsigned auto_increment not null primary key,
   info varchar(1024),
   added datetime,
-  heartbeat datetime,
+  heartbeat datetime(6),
   exited datetime
 );
 

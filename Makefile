@@ -20,3 +20,4 @@ worker:
 
 select_workers:
 	docker exec -it mysql mysql drcron -e 'SELECT * FROM workers'
+

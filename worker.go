@@ -43,19 +43,42 @@ func (worker *CronWorker) Info() string {
 	return hostname
 }
 
-func (worker *CronWorker) Join() {
+func (worker *CronWorker) JoinWorkerPool() {
 	stmt, err := worker.Db.Prepare("INSERT INTO workers (info) VALUES (?)")
+	if err != nil {
+		panic(err)
+	}
 	defer stmt.Close()
 	res, err := stmt.Exec(worker.Info())
 	if err != nil {
 		panic(err)
 	}
+	defer stmt.Close()
 	wid, err := res.LastInsertId()
 	if err != nil {
 		panic(err)
 	}
 	worker.Id = wid
 	fmt.Fprintln(os.Stderr, "My worker ID is ", worker.Id)
+	worker.Heartbeat()
+}
+
+func (worker *CronWorker) Heartbeat() {
+	query := fmt.Sprintf("UPDATE workers SET heartbeat = NOW(6) WHERE id = %d", worker.Id)
+	hbquery := func(t time.Time) {
+		_, err := worker.Db.Exec(query)
+		if err != nil {
+			panic(err)
+		}
+		fmt.Fprintln(os.Stdout, "Heartbeat at ", t)
+	}
+	hbquery(time.Now().UTC())
+	go func() {
+		beat := time.NewTicker(10 * time.Second)
+		for t := range beat.C {
+			hbquery(t)
+		}
+	}()
 }
 
 func (worker *CronWorker) FindWork() {
@@ -323,9 +346,9 @@ func (worker *CronWorker) FindAssignedWork() (execs []*Execution) {
 		if err := rows.Scan(&ex.execution_id, &ex.command); err != nil {
 			panic(fmt.Sprintln("Failed to scan next job execution query result: ", err))
 		}
-    if false {
-		  fmt.Fprintln(os.Stderr, "FindAssignedWork query returned job exec Id %d, %s", ex.execution_id, ex.command)
-    }
+		if false {
+			fmt.Fprintln(os.Stderr, "FindAssignedWork query returned job exec Id %d, %s", ex.execution_id, ex.command)
+		}
 		execs = append(execs, ex)
 	}
 	return execs
@@ -358,12 +381,12 @@ func (w *CronWorker) TimeTillNextJob() (microseconds int) {
 	if rows.Next() {
 		if err := rows.Scan(&microseconds); err != nil {
 			panic(fmt.Sprintln("Failed to scan query '%s' result row: %T %s", query, err, err.Error()))
-    }
+		}
 	}
-  // if it's this close, don't sleep.  
-  if microseconds < 0 {
-    microseconds = 0
-  }
+	// if it's this close, don't sleep.
+	if microseconds < 0 {
+		microseconds = 0
+	}
 	return
 }
 
@@ -409,13 +432,13 @@ func main() {
 	if err != nil {
 		panic(*err)
 	}
-	worker.Join()
-  var already_said bool = false // notify once for polling loop
+	worker.JoinWorkerPool()
+	var already_said bool = false // notify once for polling loop
 	for {
 		worker.AssignWork()
 		execs := worker.FindAssignedWork()
 		if len(execs) > 0 {
-      already_said = false; // if we get into a polling loop for new work, we should notify once.
+			already_said = false       // if we get into a polling loop for new work, we should notify once.
 			for _, ex := range execs { //TODO: parallelize
 				cmd := exec.Command("bash", "-c", ex.command)
 				//var stdoutBuf, stderrBuf bytes.Buffer
@@ -457,19 +480,19 @@ func main() {
 			// we scheduled something
 			continue
 		} else {
-      usec := worker.TimeTillNextJob()
-      if usec > 3000000 {
-        // 3 seconds ?  We bettr check again for new jobs eventually
-			  if ! already_said {
-          fmt.Fprintf(os.Stderr, "No work to do for at least 3 seconds; I'll poll every 3 sec for new jobs.\n")
-          already_said = true
-        }
-			  time.Sleep(time.Duration(3) * time.Second )
-      } else if usec > 2000 {
-        already_said = false // if we miss our job, and get into a 3 second loop, we should say so agian.
-			  fmt.Fprintf(os.Stderr, "No work to do at the moment and nothing to schedule; sleeping %d us for next job\n",usec)
-			  time.Sleep(time.Duration(usec) * time.Microsecond )
-      } // under 2ms? let's just try again , it'll take 2ms to have gotten this response and rerun the query.
+			usec := worker.TimeTillNextJob()
+			if usec > 3000000 {
+				// 3 seconds ?  We bettr check again for new jobs eventually
+				if !already_said {
+					fmt.Fprintf(os.Stderr, "No work to do for at least 3 seconds; I'll poll every 3 sec for new jobs.\n")
+					already_said = true
+				}
+				time.Sleep(time.Duration(3) * time.Second)
+			} else if usec > 2000 {
+				already_said = false // if we miss our job, and get into a 3 second loop, we should say so agian.
+				fmt.Fprintf(os.Stderr, "No work to do at the moment and nothing to schedule; sleeping %d us for next job\n", usec)
+				time.Sleep(time.Duration(usec) * time.Microsecond)
+			} // under 2ms? let's just try again , it'll take 2ms to have gotten this response and rerun the query.
 			continue
 		}
 		if len(os.Getenv("ONEPASS")) > 0 {
