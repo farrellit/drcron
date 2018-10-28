@@ -461,6 +461,44 @@ func (lw *LogWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+func (worker *CronWorker) RunJob(ex *Execution) { //TODO: parallelize
+	cmd := exec.Command("bash", "-c", ex.command)
+	//var stdoutBuf, stderrBuf bytes.Buffer
+	stdoutIn, _ := cmd.StdoutPipe()
+	stderrIn, _ := cmd.StderrPipe()
+	stdout := io.MultiWriter(os.Stdout /*&stdoutBuf,*/, worker.GetLogWriter(ex, "stdout"))
+	stderr := io.MultiWriter(os.Stderr /*&stderrBuf,*/, worker.GetLogWriter(ex, "stderr"))
+	var errStdout, errStderr error
+	go func() {
+		_, errStdout = io.Copy(stdout, stdoutIn)
+	}()
+	go func() {
+		_, errStderr = io.Copy(stderr, stderrIn)
+	}()
+	starterr := cmd.Start()
+	if starterr != nil {
+		// TODO: better error handling
+		panic(fmt.Sprintf("error starting command: %s", starterr.Error()))
+	}
+	fmt.Printf("Exec job command '%s'", ex.command)
+	worker.recordExecStart(ex)
+	// TODO: a goroutine could update the database for us for the pings, could send and clear stderr buffers too ?
+	waiterr := cmd.Wait()
+	worker.recordExecEnd(ex, waiterr)
+	if waiterr != nil {
+		panic(waiterr)
+	}
+	if errStdout != nil {
+		fmt.Fprintf(os.Stderr, "Warning, failed to capture stdout - %T - %s\n", errStdout, errStdout.Error())
+	}
+	if errStderr != nil {
+		fmt.Fprintf(os.Stderr, "Warning, failed to capture stderr - %T - %s\n", errStderr, errStderr.Error())
+	}
+	// TODO: ping while command runs and update
+	fmt.Printf("Job finished.\n")
+	//TODO: save results to database
+}
+
 func (worker *CronWorker) WorkerThread() {
 	var already_said bool = false
 	for {
@@ -469,44 +507,10 @@ func (worker *CronWorker) WorkerThread() {
 		if len(execs) > 0 {
 			already_said = false       // if we get into a polling loop for new work, we should notify once. Otherwise it gets too loud.
 			for _, ex := range execs { //TODO: parallelize
-				cmd := exec.Command("bash", "-c", ex.command)
-				//var stdoutBuf, stderrBuf bytes.Buffer
-				stdoutIn, _ := cmd.StdoutPipe()
-				stderrIn, _ := cmd.StderrPipe()
-				stdout := io.MultiWriter(os.Stdout /*&stdoutBuf,*/, worker.GetLogWriter(ex, "stdout"))
-				stderr := io.MultiWriter(os.Stderr /*&stderrBuf,*/, worker.GetLogWriter(ex, "stderr"))
-				var errStdout, errStderr error
-				go func() {
-					_, errStdout = io.Copy(stdout, stdoutIn)
-				}()
-				go func() {
-					_, errStderr = io.Copy(stderr, stderrIn)
-				}()
-				starterr := cmd.Start()
-				if starterr != nil {
-					// TODO: better error handling
-					panic(fmt.Sprintf("error starting command: %s", starterr.Error()))
-				}
-				fmt.Printf("Exec job command '%s'", ex.command)
-				worker.recordExecStart(ex)
-				// TODO: a goroutine could update the database for us for the pings, could send and clear stderr buffers too ?
-				waiterr := cmd.Wait()
-				worker.recordExecEnd(ex, waiterr)
-				if waiterr != nil {
-					panic(waiterr)
-				}
-				if errStdout != nil {
-					fmt.Fprintf(os.Stderr, "Warning, failed to capture stdout - %T - %s\n", errStdout, errStdout.Error())
-				}
-				if errStderr != nil {
-					fmt.Fprintf(os.Stderr, "Warning, failed to capture stderr - %T - %s\n", errStderr, errStderr.Error())
-				}
-				// TODO: ping while command runs and update
-				fmt.Printf("Job finished.\n")
-				//TODO: save results to database
+				worker.RunJob(ex)
 			}
 		} else if worker.ScheduleNextRun() > 0 {
-			// we scheduled something
+			// we scheduled at least one thing, let's try to pick up that job now.
 			continue
 		} else {
 			worker.WorklessWait(&already_said)
