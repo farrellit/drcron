@@ -13,10 +13,36 @@ import (
 	"time"
 )
 
+type RunControl struct {
+	running uint
+	done    chan bool
+	ended   chan bool
+}
+
+func NewRunControl() *RunControl {
+	rc := new(RunControl)
+	rc.done = make(chan bool)
+	rc.ended = make(chan bool)
+	return rc
+}
+
+func (rc *RunControl) Add() {
+	rc.running++
+}
+
+func (rc *RunControl) Cleanup() {
+	close(rc.done)
+	for rc.running > 0 {
+		<-rc.ended
+		rc.running--
+	}
+}
+
 type CronWorker struct {
 	Db         *sql.DB
 	Id         int64
 	CronParser *cron.Parser
+	rc         *RunControl
 }
 
 func NewCronWorker(conn string) (worker *CronWorker, err *error) {
@@ -31,6 +57,7 @@ func NewCronWorker(conn string) (worker *CronWorker, err *error) {
 	worker = new(CronWorker)
 	worker.Db = db
 	worker.CronParser = &parser
+	worker.rc = NewRunControl()
 	err = nil
 	return
 }
@@ -73,10 +100,17 @@ func (worker *CronWorker) Heartbeat() {
 		fmt.Fprintln(os.Stdout, "Heartbeat at ", t)
 	}
 	hbquery(time.Now().UTC())
+	worker.rc.Add()
 	go func() {
 		beat := time.NewTicker(10 * time.Second)
-		for t := range beat.C {
+		select {
+		case t := <-beat.C:
 			hbquery(t)
+		case _, ok := <-worker.rc.done:
+			if !ok {
+				worker.rc.ended <- true
+				return
+			}
 		}
 	}()
 }
@@ -427,18 +461,13 @@ func (lw *LogWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func main() {
-	worker, err := NewCronWorker("root:@tcp(127.0.0.1:3306)/drcron")
-	if err != nil {
-		panic(*err)
-	}
-	worker.JoinWorkerPool()
-	var already_said bool = false // notify once for polling loop
+func (worker *CronWorker) WorkerThread() {
+	var already_said bool = false
 	for {
 		worker.AssignWork()
 		execs := worker.FindAssignedWork()
 		if len(execs) > 0 {
-			already_said = false       // if we get into a polling loop for new work, we should notify once.
+			already_said = false       // if we get into a polling loop for new work, we should notify once. Otherwise it gets too loud.
 			for _, ex := range execs { //TODO: parallelize
 				cmd := exec.Command("bash", "-c", ex.command)
 				//var stdoutBuf, stderrBuf bytes.Buffer
@@ -480,24 +509,36 @@ func main() {
 			// we scheduled something
 			continue
 		} else {
-			usec := worker.TimeTillNextJob()
-			if usec > 3000000 {
-				// 3 seconds ?  We bettr check again for new jobs eventually
-				if !already_said {
-					fmt.Fprintf(os.Stderr, "No work to do for at least 3 seconds; I'll poll every 3 sec for new jobs.\n")
-					already_said = true
-				}
-				time.Sleep(time.Duration(3) * time.Second)
-			} else if usec > 2000 {
-				already_said = false // if we miss our job, and get into a 3 second loop, we should say so agian.
-				fmt.Fprintf(os.Stderr, "No work to do at the moment and nothing to schedule; sleeping %d us for next job\n", usec)
-				time.Sleep(time.Duration(usec) * time.Microsecond)
-			} // under 2ms? let's just try again , it'll take 2ms to have gotten this response and rerun the query.
-			continue
+			worker.WorklessWait(&already_said)
 		}
 		if len(os.Getenv("ONEPASS")) > 0 {
 			fmt.Fprintln(os.Stderr, "ONEPASS is configured, so I'll exit now.")
 			break
 		}
 	}
+}
+
+func main() {
+	worker, err := NewCronWorker("root:@tcp(127.0.0.1:3306)/drcron")
+	if err != nil {
+		panic(*err)
+	}
+	worker.JoinWorkerPool()
+	worker.WorkerThread()
+}
+
+func (worker *CronWorker) WorklessWait(already_said *bool) {
+	usec := worker.TimeTillNextJob()
+	if usec > 3000000 {
+		// 3 seconds ?  We bettr check again for new jobs eventually
+		if !*already_said {
+			fmt.Fprintf(os.Stderr, "No work to do for at least 3 seconds; I'll poll every 3 sec for new jobs.\n")
+			*already_said = true
+		}
+		time.Sleep(time.Duration(3) * time.Second)
+	} else if usec > 2000 {
+		*already_said = false // if we miss our job, and get into a 3 second loop, we should say so agian.
+		fmt.Fprintf(os.Stderr, "No work to do at the moment and nothing to schedule; sleeping %d us for next job\n", usec)
+		time.Sleep(time.Duration(usec) * time.Microsecond)
+	} // under 2ms? let's just try again , it'll take 2ms to have gotten this response and rerun the query.
 }
