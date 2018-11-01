@@ -22,6 +22,10 @@ type NullTime struct {
   mysql.NullTime
 }
 
+type NullInt64 struct {
+  sql.NullInt64
+}
+
 func (nt *NullTime)MarshalJSON() ([]byte, error){
   if nt.Valid {
     return json.Marshal(fmt.Sprint(nt.Time))
@@ -31,7 +35,14 @@ func (nt *NullTime)MarshalJSON() ([]byte, error){
 
 func (ns *NullString)MarshalJSON() ([]byte, error){
   if ns.Valid {
-    return json.Marshal(fmt.Sprintf(ns.String))
+    return json.Marshal(ns.String)
+  }
+  return jsonNull(), nil
+}
+
+func (ni *NullInt64)MarshalJSON() ([]byte, error){
+  if ni.Valid {
+    return json.Marshal(ni.Int64)
   }
   return jsonNull(), nil
 }
@@ -58,8 +69,15 @@ type JobRow struct {
 }
 
 type JobExecutionRow struct {
-  Worker WorkerRow
-  Job JobRow
+  Id int64
+  JobId int64
+  WorkerId int64
+  Queued NullTime
+  Scheduled_start NullTime
+  Started NullTime
+  Pid NullInt64
+  Ended NullTime
+  Exit_code NullInt64
 }
 
 type RouteHandler interface {
@@ -107,7 +125,7 @@ func main() {
     panic(err)
   }
   routes := []RouteHandler{
-    &QueryResult{
+    &QueryResult{ //Workers
       query: "SELECT id, info, added, heartbeat, exited FROM workers",
       urlpath: "/workers",
       doScan: func(row *sql.Rows)(interface{},error){
@@ -116,13 +134,26 @@ func main() {
         return worker, err
       },
     },
-    &QueryResult{
+    &QueryResult{ // Jobs
       query: "SELECT id, created, updated, name, schedule, command, enabled, run_parallel, schedule_error, schedule_error_time FROM jobs",
       urlpath: "/jobs",
       doScan: func(row *sql.Rows)(interface{},error){
         job:= new(JobRow)
         err := row.Scan(&job.Id, &job.Created, &job.Updated, &job.Name, &job.Schedule, &job.Command, &job.Enabled, &job.Run_parallel, &job.Schedule_error, &job.Schedule_error_time)
         return job, err
+      },
+    },
+    &QueryResult{ //JobExecutions
+      query: "SELECT id, job_id, worker_id, queued, scheduled_start, started, pid, ended, exit_code FROM job_executions ",
+      urlpath: "/executions",
+      doScan: func(row *sql.Rows)(interface{},error){
+        je := new(JobExecutionRow)
+        err := row.Scan(
+          &je.Id, &je.JobId, &je.WorkerId,
+          &je.Queued, &je.Scheduled_start, &je.Started,
+          &je.Pid, &je.Ended, &je.Exit_code,
+        )
+        return je, err
       },
     },
   }
